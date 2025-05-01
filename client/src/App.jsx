@@ -6,8 +6,16 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const [videoInfo, setVideoInfo] = useState(null);
-  const [downloading, setDownloading] = useState(false);
-  const [downloadType, setDownloadType] = useState('video'); // 'video' or 'audio'
+  const [downloading, setDownloading] = useState({
+    status: false,
+    type: '', // 'video', 'audio', or 'merge'
+    progress: 0
+  });
+  const [downloadType, setDownloadType] = useState('video');
+  const [selectedFormats, setSelectedFormats] = useState({
+    video: null,
+    audio: null
+  });
 
   const handleDownload = async () => {
     if (!url) {
@@ -21,72 +29,189 @@ function App() {
 
     try {
       const response = await fetch(`http://localhost:5000/videoInfo?url=${encodeURIComponent(url)}`);
-      const data = await response.json();
-
-      if (response.ok) {
-        setVideoInfo(data);
-      } else {
-        setError(data.error || 'Failed to fetch video information');
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
+      const data = await response.json();
+      setVideoInfo(data);
     } catch (err) {
-      setError('Failed to connect to the server');
+      console.error('Fetch error:', err);
+      setError(err.message || 'Failed to fetch video information');
     } finally {
       setIsLoading(false);
     }
   };
 
-  const handleFormatDownload = async (itag) => {
-    if (!url || downloading) return;
-  
-    setDownloading(true);
-    setError('');
-    
+  const downloadFile = async (endpoint, type) => {
     try {
-      const endpoint = downloadType === 'audio' 
-        ? `/download/audio?url=${encodeURIComponent(url)}${itag ? `&itag=${itag}` : ''}`
-        : `/download?url=${encodeURIComponent(url)}&itag=${itag}`;
-  
       const response = await fetch(`http://localhost:5000${endpoint}`);
-  
-      if (response.ok) {
-        const contentType = response.headers.get('content-type');
-        const filename = response.headers
-          .get('content-disposition')
-          ?.split('filename=')[1]
-          ?.replace(/"/g, '') || `${downloadType}.${downloadType === 'audio' ? 'mp3' : 'mp4'}`;
-  
-        // Handle file download
-        if ((downloadType === 'audio' && contentType.includes('audio/mpeg')) || 
-            (downloadType === 'video' && contentType.includes('video/mp4'))) {
-          const blob = await response.blob();
-          const url = window.URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = filename;
-          document.body.appendChild(a);
-          a.click();
-          window.URL.revokeObjectURL(url);
-          a.remove();
-        }
-      } else {
-        const errorData = await response.json();
-        setError(errorData.error || 'Download failed');
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
       }
+
+      const reader = response.body.getReader();
+      const contentLength = +response.headers.get('Content-Length');
+      let receivedLength = 0;
+      let chunks = [];
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        chunks.push(value);
+        receivedLength += value.length;
+        setDownloading(prev => ({
+          ...prev,
+          progress: Math.round((receivedLength / contentLength) * 100)
+        }));
+      }
+
+      return new Blob(chunks, { type: type === 'video' ? 'video/mp4' : 'audio/mpeg' });
     } catch (err) {
-      setError('Download failed: ' + err.message);
-    } finally {
-      setDownloading(false);
+      console.error('Download error:', err);
+      throw err;
     }
   };
 
-  const filteredFormats = () => {
-    if (!videoInfo) return [];
-    
+  const handleFormatSelect = (format, type) => {
+    setSelectedFormats(prev => ({
+      ...prev,
+      [type]: format
+    }));
+  };
+
+  const handleSeparateDownload = async (type) => {
+    if (!url || downloading.status) return;
+
+    const format = type === 'video' ? selectedFormats.video : selectedFormats.audio;
+    if (!format) {
+      setError(`Please select a ${type} format first`);
+      return;
+    }
+
+    setDownloading({
+      status: true,
+      type: type,
+      progress: 0
+    });
+    setError('');
+
+    try {
+      const endpoint = type === 'audio'
+        ? `/download/audio?url=${encodeURIComponent(url)}&itag=${format.itag}`
+        : `/download?url=${encodeURIComponent(url)}&itag=${format.itag}`;
+
+      const blob = await downloadFile(endpoint, type);
+
+      // Create download link
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `${type}.${type === 'audio' ? 'mp3' : 'mp4'}`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+
+    } catch (err) {
+      console.error('Download failed:', err);
+      setError(`Download failed: ${err.message}`);
+    } finally {
+      setDownloading({
+        status: false,
+        type: '',
+        progress: 0
+      });
+    }
+  };
+
+  const handleMergeDownload = async () => {
+    if (!url || downloading.status || !selectedFormats.video || !selectedFormats.audio) {
+      setError('Please select both video and audio formats first');
+      return;
+    }
+  
+    setDownloading({
+      status: true,
+      type: 'merge',
+      progress: 0
+    });
+    setError('');
+  
+    try {
+      // 1. Download video (30% of progress)
+      setDownloading(prev => ({ ...prev, progress: 30 }));
+      const videoResponse = await fetch(
+        `http://localhost:5000/download?url=${encodeURIComponent(url)}&itag=${selectedFormats.video.itag}`
+      );
+      if (!videoResponse.ok) throw new Error('Video download failed');
+      const videoBlob = await videoResponse.blob();
+  
+      // 2. Download audio (60% of progress)
+      setDownloading(prev => ({ ...prev, progress: 60 }));
+      const audioResponse = await fetch(
+        `http://localhost:5000/download/audio?url=${encodeURIComponent(url)}&itag=${selectedFormats.audio.itag}`
+      );
+      if (!audioResponse.ok) throw new Error('Audio download failed');
+      const audioBlob = await audioResponse.blob();
+  
+      // 3. Prepare FormData (70% of progress)
+      setDownloading(prev => ({ ...prev, progress: 70 }));
+      const formData = new FormData();
+      formData.append('video', videoBlob, 'video.mp4');
+      formData.append('audio', audioBlob, 'audio.mp3');
+  
+      // 4. Merge files (80% of progress)
+      setDownloading(prev => ({ ...prev, progress: 80 }));
+      const mergeResponse = await fetch('http://localhost:5000/merge', {
+        method: 'POST',
+        body: formData
+      });
+  
+      const mergeResult = await mergeResponse.json();
+      if (!mergeResult.success) {
+        throw new Error(mergeResult.error || 'Merge failed');
+      }
+  
+      // 5. Download merged file (90% of progress)
+      setDownloading(prev => ({ ...prev, progress: 90 }));
+      const mergedResponse = await fetch(
+        `http://localhost:5000/download-merged?filename=${mergeResult.filename}`
+      );
+      if (!mergedResponse.ok) throw new Error('Failed to download merged file');
+      const mergedBlob = await mergedResponse.blob();
+  
+      // Save merged file (100% of progress)
+      setDownloading(prev => ({ ...prev, progress: 100 }));
+      const downloadUrl = window.URL.createObjectURL(mergedBlob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = 'merged_video.mp4';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+  
+    } catch (err) {
+      console.error('Merge process error:', err);
+      setError(`Merge failed: ${err.message}`);
+    } finally {
+      setDownloading({
+        status: false,
+        type: '',
+        progress: 0
+      });
+    }
+  };
+
+  const filteredFormats = (type) => {
+    if (!videoInfo?.formats) return [];
+
     return videoInfo.formats.filter(format => {
-      if (downloadType === 'audio') {
-        return format.type.includes('audio');
+      if (type === 'audio') {
+        return format.type?.includes('audio');
       } else {
-        return format.type.includes('video') && !format.type.includes('audio only');
+        return format.type?.includes('video') && !format.type?.includes('audio only');
       }
     });
   };
@@ -104,25 +229,24 @@ function App() {
             className='border-2 border-gray-300 rounded-md p-2 w-full'
             value={url}
             onChange={(e) => setUrl(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleDownload()}
           />
 
           <div className="flex gap-4">
             <button
-              className={`px-4 py-2 rounded-md font-bold transition-colors ${
-                downloadType === 'video' 
-                  ? 'bg-yellow-400 text-black' 
+              className={`px-4 py-2 rounded-md font-bold transition-colors ${downloadType === 'video'
+                  ? 'bg-yellow-400 text-black'
                   : 'bg-gray-200 text-gray-700'
-              }`}
+                }`}
               onClick={() => setDownloadType('video')}
             >
               Video
             </button>
             <button
-              className={`px-4 py-2 rounded-md font-bold transition-colors ${
-                downloadType === 'audio' 
-                  ? 'bg-yellow-400 text-black' 
+              className={`px-4 py-2 rounded-md font-bold transition-colors ${downloadType === 'audio'
+                  ? 'bg-yellow-400 text-black'
                   : 'bg-gray-200 text-gray-700'
-              }`}
+                }`}
               onClick={() => setDownloadType('audio')}
             >
               Audio
@@ -139,6 +263,19 @@ function App() {
 
           {error && <p className="text-red-500">{error}</p>}
 
+          {downloading.status && (
+            <div className="w-full bg-gray-200 rounded-full h-2.5">
+              <div
+                className="bg-blue-600 h-2.5 rounded-full"
+                style={{ width: `${downloading.progress}%` }}
+              ></div>
+              <p className="text-sm mt-1">
+                {downloading.type === 'merge' ? 'Merging files...' : `Downloading ${downloading.type}...`}
+                ({downloading.progress}%)
+              </p>
+            </div>
+          )}
+
           {videoInfo && (
             <div className="w-full mt-6 text-left bg-gray-100 p-4 rounded-lg">
               <div className="flex flex-col md:flex-row gap-4">
@@ -147,29 +284,82 @@ function App() {
                     src={videoInfo.thumbnail}
                     alt="Video thumbnail"
                     className="aspect-video w-full rounded-lg"
+                    onError={(e) => {
+                      e.target.onerror = null;
+                      e.target.src = 'https://via.placeholder.com/320x180?text=Thumbnail+Not+Available';
+                    }}
                   />
                 </div>
                 <div className="flex-1">
-                  <h2 className="text-xl font-bold">{videoInfo.title}</h2>
-                  <h3 className="text-lg font-semibold mt-4">
-                    Available {downloadType === 'audio' ? 'Audio' : 'Video'} Formats:
-                  </h3>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
-                    {filteredFormats().map((format, index) => (
-                      <button
-                        key={index}
-                        className="bg-blue-500 hover:bg-blue-600 text-white rounded-md p-2 transition-colors text-sm"
-                        onClick={() => handleFormatDownload(format.itag)}
-                        disabled={downloading}
-                      >
-                        {downloadType === 'audio' ? (
-                          `Download ${format.audioBitrate ? format.audioBitrate + 'kbps' : format.quality}`
-                        ) : (
-                          `Download ${format.quality} (${format.type})`
-                        )}
-                      </button>
-                    ))}
+                  <h2 className="text-xl font-bold">{videoInfo.title || 'Untitled Video'}</h2>
+
+                  {/* Video Formats Section */}
+                  <div className="mt-4">
+                    <h3 className="text-lg font-semibold">Video Formats:</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+                      {filteredFormats('video').map((format, index) => (
+                        <div key={`video-${index}`} className="flex items-center gap-2">
+                          <button
+                            className={`flex-1 bg-blue-500 hover:bg-blue-600 text-white rounded-md p-2 transition-colors text-sm ${selectedFormats.video?.itag === format.itag ? 'ring-2 ring-blue-700' : ''
+                              }`}
+                            onClick={() => handleFormatSelect(format, 'video')}
+                            disabled={downloading.status}
+                          >
+                            {format.quality || 'Unknown'} ({format.type || 'Unknown'})
+                          </button>
+                          <button
+                            className="bg-green-500 hover:bg-green-600 text-white rounded-md p-2 transition-colors text-sm"
+                            onClick={() => handleSeparateDownload('video')}
+                            disabled={downloading.status}
+                          >
+                            Download
+                          </button>
+                        </div>
+                      ))}
+                    </div>
                   </div>
+
+                  {/* Audio Formats Section */}
+                  <div className="mt-4">
+                    <h3 className="text-lg font-semibold">Audio Formats:</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+                      {filteredFormats('audio').map((format, index) => (
+                        <div key={`audio-${index}`} className="flex items-center gap-2">
+                          <button
+                            className={`flex-1 bg-blue-500 hover:bg-blue-600 text-white rounded-md p-2 transition-colors text-sm ${selectedFormats.audio?.itag === format.itag ? 'ring-2 ring-blue-700' : ''
+                              }`}
+                            onClick={() => handleFormatSelect(format, 'audio')}
+                            disabled={downloading.status}
+                          >
+                            {format.audioBitrate ? `${format.audioBitrate}kbps` : format.quality || 'Unknown'}
+                          </button>
+                          <button
+                            className="bg-green-500 hover:bg-green-600 text-white rounded-md p-2 transition-colors text-sm"
+                            onClick={() => handleSeparateDownload('audio')}
+                            disabled={downloading.status}
+                          >
+                            Download
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Merge Button */}
+                  {selectedFormats.video && selectedFormats.audio && (
+                    <div className="mt-4">
+                      <button
+                        className="w-full bg-purple-500 hover:bg-purple-600 text-white rounded-md p-2 transition-colors font-bold"
+                        onClick={handleMergeDownload}
+                        disabled={downloading.status}
+                      >
+                        Download Merged Video+Audio (
+                        {selectedFormats.video.quality || 'Unknown'} +
+                        {selectedFormats.audio.audioBitrate ? `${selectedFormats.audio.audioBitrate}kbps` : 'Unknown'}
+                        )
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

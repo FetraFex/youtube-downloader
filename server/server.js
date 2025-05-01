@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const { spawn } = require('child_process');
 const app = express();
-const path = require('path');
-const fs = require('fs');
+
+const { exec } = require('child_process');
 
 // Middleware
 app.use(cors());
@@ -63,71 +63,67 @@ const runYtDlpCommand = (args, options = {}) => {
 app.get('/videoInfo', async (req, res) => {
   try {
     const { url } = req.query;
-    if (!url) {
-      return res.status(400).json({ error: 'YouTube URL is required' });
-    }
+    if (!url) return res.status(400).json({ error: 'URL required' });
 
     const info = await runYtDlpCommand([
       url,
       '--dump-json',
       '--no-warnings',
-      '--force-ipv4',
-      '--socket-timeout', '30'
+      '--force-ipv4'
     ]);
 
-    const formats = info.formats
-      .filter((f) => f.vcodec || f.acodec) // Filter out formats without codec info
-      .map((format) => {
-        // Determine format type
-        let type = '';
-        if (format.vcodec && format.vcodec !== 'none' && format.acodec && format.acodec !== 'none') {
-          type = 'video+audio';
-        } else if (format.vcodec && format.vcodec !== 'none') {
-          type = 'video only';
-        } else if (format.acodec && format.acodec !== 'none') {
-          type = 'audio only';
-        }
+    // Process formats with better merging detection
+    const formats = info.formats.map(format => {
+      const isCombined = format.acodec && format.acodec !== 'none' && 
+                         format.vcodec && format.vcodec !== 'none';
+      const isVideo = format.vcodec && format.vcodec !== 'none';
+      const isAudio = format.acodec && format.acodec !== 'none';
 
-        // Format quality label
-        let quality = '';
-        if (format.height) {
-          quality = `${format.height}p`;
-        } else if (format.abr) {
-          quality = `${format.abr}kbps`;
-        } else {
-          quality = format.format_note || format.ext.toUpperCase();
-        }
+      let type;
+      if (isCombined) type = 'video+audio';
+      else if (isVideo) type = 'video only';
+      else if (isAudio) type = 'audio only';
 
+      return {
+        itag: format.format_id,
+        quality: format.height ? `${format.height}p` : 
+                format.abr ? `${format.abr}kbps` : 
+                format.format_note || format.ext.toUpperCase(),
+        type,
+        codec: {
+          video: format.vcodec,
+          audio: format.acodec
+        },
+        filesize: format.filesize ? `${(format.filesize/(1024*1024)).toFixed(2)}MB` : 'N/A'
+      };
+    }).filter(f => f.type); // Remove invalid formats
+
+    // Add merge suggestions for higher quality videos
+    const enhancedFormats = formats.map(format => {
+      if (format.type === 'video only') {
+        // Find compatible audio streams
+        const compatibleAudio = formats.find(f => 
+          f.type === 'audio only' && 
+          !f.quality.includes('video') // Ensure it's pure audio
+        );
         return {
-          itag: format.format_id,
-          quality,
-          type,
-          filesize: format.filesize ? `${(format.filesize / (1024 * 1024)).toFixed(2)} MB` : 'Unknown',
-          hasAudio: format.acodec && format.acodec !== 'none',
-          hasVideo: format.vcodec && format.vcodec !== 'none',
-          audioBitrate: format.abr,
-          videoResolution: format.height,
-          container: format.ext,
-          codecs: {
-            video: format.vcodec,
-            audio: format.acodec
-          }
+          ...format,
+          canMerge: !!compatibleAudio,
+          mergeWith: compatibleAudio?.itag
         };
-      })
-      .filter(f => f.type); // Remove any formats we couldn't categorize
+      }
+      return format;
+    });
 
     res.json({
       title: info.title,
       thumbnail: info.thumbnail,
       duration: info.duration_string,
-      formats
+      formats: enhancedFormats
     });
   } catch (error) {
-    console.error('Video info error:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch video info',
-      details: error.message
-    });
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -271,6 +267,106 @@ app.get('/download/audio', async (req, res) => {
       });
     }
   }
+});
+
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const fileUpload = require('express-fileupload');
+
+// Set ffmpeg path
+app.use(fileUpload());
+ffmpeg.setFfmpegPath(ffmpegPath);
+
+app.post('/merge', async (req, res) => {
+  try {
+    // Check if files were uploaded
+    if (!req.files || !req.files.video || !req.files.audio) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Both video and audio files are required' 
+      });
+    }
+
+    // Create temporary directory
+    const tempDir = path.join(os.tmpdir(), 'yt-merge');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    // Generate unique filenames
+    const timestamp = Date.now();
+    const videoPath = path.join(tempDir, `video_${timestamp}.mp4`);
+    const audioPath = path.join(tempDir, `audio_${timestamp}.mp3`);
+    const outputPath = path.join(tempDir, `merged_${timestamp}.mp4`);
+    
+
+    // Save files
+    await req.files.video.mv(videoPath);
+    await req.files.audio.mv(audioPath);
+
+    // Merge files
+    await new Promise((resolve, reject) => {
+      ffmpeg()
+        .input(videoPath)
+        .input(audioPath)
+        .outputOptions([
+          '-c:v copy',        // Copy video stream
+          '-c:a aac',         // Convert audio to AAC
+          '-movflags +faststart' // Enable streaming
+        ])
+        .output(outputPath)
+        .on('start', (command) => console.log('FFmpeg command:', command))
+        .on('progress', (progress) => console.log('Processing:', progress))
+        .on('end', () => {
+          console.log('Merge completed successfully');
+          resolve();
+        })
+        .on('error', (err) => {
+          console.error('FFmpeg error:', err);
+          reject(new Error('Failed to merge files'));
+        })
+        .run();
+    });
+
+    // Respond with success
+    res.json({ 
+      success: true,
+      filename: `merged_${timestamp}.mp4`
+    });
+
+  } catch (error) {
+    console.error('Merge error:', error);
+    res.status(500).json({ 
+      success: false,
+      error: error.message || 'Merge failed'
+    });
+  }
+});
+
+// Download merged file endpoint
+app.get('/download-merged', (req, res) => {
+  const { filename } = req.query;
+  if (!filename) {
+    return res.status(400).send('Filename is required');
+  }
+
+  const tempDir = path.join(os.tmpdir(), 'yt-merge');
+  const filePath = path.join(tempDir, filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send('File not found');
+  }
+
+  res.download(filePath, 'merged_video.mp4', (err) => {
+    if (err) {
+      console.error('Download error:', err);
+    }
+    // Optionally clean up the file after download
+    // fs.unlinkSync(filePath);
+  });
 });
 
 const PORT = process.env.PORT || 5000;
