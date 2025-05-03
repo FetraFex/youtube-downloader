@@ -130,58 +130,89 @@ function App() {
       setError('Please select both video and audio formats first');
       return;
     }
-  
+
     setDownloading({
       status: true,
       type: 'merge',
       progress: 0
     });
     setError('');
-  
+
+    let progressEventSource = null;
+
     try {
-      // 1. Download video (30% of progress)
+      // 1. Setup progress tracking for video download only
+      const streamId = Math.random().toString(36).substring(7);
+      progressEventSource = new EventSource(
+        `http://localhost:5000/download/progress/${streamId}`
+      );
+
+      progressEventSource.onmessage = (e) => {
+        const { type, data } = JSON.parse(e.data);
+        if (type === 'progress') {
+          console.log('Video Download Progress:', data);
+
+          // Optional parsing of progress details
+          const progressMatch = data.match(/\[download\]\s+([\d.]+)% of\s+([\d.]+)(\w+) at\s+([\d.]+)(\w+\/s) ETA (\d+:\d+)/);
+          if (progressMatch) {
+            const [, percent, size, sizeUnit, speed, speedUnit, eta] = progressMatch;
+            console.log('Parsed Progress:', {
+              percentage: parseFloat(percent),
+              size: `${size} ${sizeUnit}`,
+              speed: `${speed} ${speedUnit}`,
+              eta
+            });
+          }
+        }
+        else if (type === 'error') {
+          console.error('Download error:', data);
+        }
+      };
+
+      // 2. Download video with progress tracking
       setDownloading(prev => ({ ...prev, progress: 30 }));
       const videoResponse = await fetch(
-        `http://localhost:5000/download?url=${encodeURIComponent(url)}&itag=${selectedFormats.video.itag}`
+        `http://localhost:5000/download?url=${encodeURIComponent(url)}&itag=${selectedFormats.video.itag}&id=${streamId}`
       );
+
       if (!videoResponse.ok) throw new Error('Video download failed');
       const videoBlob = await videoResponse.blob();
-  
-      // 2. Download audio (60% of progress)
+
+      // 3. Download audio (without progress tracking)
       setDownloading(prev => ({ ...prev, progress: 60 }));
       const audioResponse = await fetch(
         `http://localhost:5000/download/audio?url=${encodeURIComponent(url)}&itag=${selectedFormats.audio.itag}`
       );
       if (!audioResponse.ok) throw new Error('Audio download failed');
       const audioBlob = await audioResponse.blob();
-  
-      // 3. Prepare FormData (70% of progress)
+
+      // 4. Prepare FormData
       setDownloading(prev => ({ ...prev, progress: 70 }));
       const formData = new FormData();
       formData.append('video', videoBlob, 'video.mp4');
       formData.append('audio', audioBlob, 'audio.mp3');
-  
-      // 4. Merge files (80% of progress)
+
+      // 5. Merge files
       setDownloading(prev => ({ ...prev, progress: 80 }));
       const mergeResponse = await fetch('http://localhost:5000/merge', {
         method: 'POST',
         body: formData
       });
-  
+
       const mergeResult = await mergeResponse.json();
       if (!mergeResult.success) {
         throw new Error(mergeResult.error || 'Merge failed');
       }
-  
-      // 5. Download merged file (90% of progress)
+
+      // 6. Download merged file
       setDownloading(prev => ({ ...prev, progress: 90 }));
       const mergedResponse = await fetch(
         `http://localhost:5000/download-merged?filename=${mergeResult.filename}`
       );
       if (!mergedResponse.ok) throw new Error('Failed to download merged file');
       const mergedBlob = await mergedResponse.blob();
-  
-      // Save merged file (100% of progress)
+
+      // 7. Save merged file
       setDownloading(prev => ({ ...prev, progress: 100 }));
       const downloadUrl = window.URL.createObjectURL(mergedBlob);
       const link = document.createElement('a');
@@ -191,11 +222,14 @@ function App() {
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(downloadUrl);
-  
+
     } catch (err) {
       console.error('Merge process error:', err);
       setError(`Merge failed: ${err.message}`);
     } finally {
+      if (progressEventSource) {
+        progressEventSource.close();
+      }
       setDownloading({
         status: false,
         type: '',
@@ -235,8 +269,8 @@ function App() {
           <div className="flex gap-4">
             <button
               className={`px-4 py-2 rounded-md font-bold transition-colors ${downloadType === 'video'
-                  ? 'bg-yellow-400 text-black'
-                  : 'bg-gray-200 text-gray-700'
+                ? 'bg-yellow-400 text-black'
+                : 'bg-gray-200 text-gray-700'
                 }`}
               onClick={() => setDownloadType('video')}
             >
@@ -244,8 +278,8 @@ function App() {
             </button>
             <button
               className={`px-4 py-2 rounded-md font-bold transition-colors ${downloadType === 'audio'
-                  ? 'bg-yellow-400 text-black'
-                  : 'bg-gray-200 text-gray-700'
+                ? 'bg-yellow-400 text-black'
+                : 'bg-gray-200 text-gray-700'
                 }`}
               onClick={() => setDownloadType('audio')}
             >

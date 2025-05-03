@@ -74,8 +74,8 @@ app.get('/videoInfo', async (req, res) => {
 
     // Process formats with better merging detection
     const formats = info.formats.map(format => {
-      const isCombined = format.acodec && format.acodec !== 'none' && 
-                         format.vcodec && format.vcodec !== 'none';
+      const isCombined = format.acodec && format.acodec !== 'none' &&
+        format.vcodec && format.vcodec !== 'none';
       const isVideo = format.vcodec && format.vcodec !== 'none';
       const isAudio = format.acodec && format.acodec !== 'none';
 
@@ -86,15 +86,15 @@ app.get('/videoInfo', async (req, res) => {
 
       return {
         itag: format.format_id,
-        quality: format.height ? `${format.height}p` : 
-                format.abr ? `${format.abr}kbps` : 
-                format.format_note || format.ext.toUpperCase(),
+        quality: format.height ? `${format.height}p` :
+          format.abr ? `${format.abr}kbps` :
+            format.format_note || format.ext.toUpperCase(),
         type,
         codec: {
           video: format.vcodec,
           audio: format.acodec
         },
-        filesize: format.filesize ? `${(format.filesize/(1024*1024)).toFixed(2)}MB` : 'N/A'
+        filesize: format.filesize ? `${(format.filesize / (1024 * 1024)).toFixed(2)}MB` : 'N/A'
       };
     }).filter(f => f.type); // Remove invalid formats
 
@@ -102,8 +102,8 @@ app.get('/videoInfo', async (req, res) => {
     const enhancedFormats = formats.map(format => {
       if (format.type === 'video only') {
         // Find compatible audio streams
-        const compatibleAudio = formats.find(f => 
-          f.type === 'audio only' && 
+        const compatibleAudio = formats.find(f =>
+          f.type === 'audio only' &&
           !f.quality.includes('video') // Ensure it's pure audio
         );
         return {
@@ -128,28 +128,60 @@ app.get('/videoInfo', async (req, res) => {
 });
 
 // Download Endpoint
-app.get('/download', async (req, res) => {
-  let childProcess;
-  try {
-    const { url, itag } = req.query;
-    if (!url || !itag) {
-      return res.status(400).json({ error: 'URL and itag are required' });
+const activeDownloads = new Map(); // Track active downloads
+
+// SSE endpoint for progress updates
+app.get('/download/progress/:id', (req, res) => {
+  const { id } = req.params;
+  
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // Heartbeat to keep connection alive
+  const heartbeat = setInterval(() => {
+    res.write(':heartbeat\n\n');
+  }, 15000);
+
+  // Add client to active downloads
+  if (!activeDownloads.has(id)) {
+    activeDownloads.set(id, new Set());
+  }
+  activeDownloads.get(id).add(res);
+
+  // Cleanup on client disconnect
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    if (activeDownloads.has(id)) {
+      activeDownloads.get(id).delete(res);
+      if (activeDownloads.get(id).size === 0) {
+        activeDownloads.delete(id);
+      }
     }
+  });
+});
 
-    const ytdlpPath = path.join(
-      __dirname,
-      process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp'
-    );
+// Download endpoint
+app.get('/download', async (req, res) => {
+  const { url, itag, id } = req.query;
+  if (!url || !itag) {
+    return res.status(400).json({ error: 'URL and itag are required' });
+  }
 
+  const downloadId = id || Math.random().toString(36).substring(7);
+  const ytdlpPath = path.join(__dirname, process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp');
+
+  try {
     if (!fs.existsSync(ytdlpPath)) {
       throw new Error(`yt-dlp binary not found at ${ytdlpPath}`);
     }
 
-    // Create the download process
-    childProcess = spawn(ytdlpPath, [
+    const childProcess = spawn(ytdlpPath, [
       url,
       '-f', itag,
       '--no-warnings',
+      '--newline', // Important for progress parsing
       '--force-ipv4',
       '--socket-timeout', '30',
       '-o', '-'
@@ -159,41 +191,86 @@ app.get('/download', async (req, res) => {
       windowsHide: true
     });
 
-    // Set response headers
+    // Set response headers for download
     res.header('Content-Disposition', 'attachment; filename="video.mp4"');
     res.header('Content-Type', 'video/mp4');
-
-    // Pipe the download stream to response
     childProcess.stdout.pipe(res);
 
-    // Error handling
+    // Process progress updates
     childProcess.stderr.on('data', (data) => {
-      console.error('yt-dlp stderr:', data.toString());
-    });
-
-    childProcess.on('error', (error) => {
-      console.error('Process error:', error);
-      if (!res.headersSent) {
-        res.status(500).json({ error: 'Download failed', details: error.message });
+      const output = data.toString().trim();
+      if (output.startsWith('[download]')) {
+        console.log(output);
+        // Send progress to all connected clients
+        if (activeDownloads.has(downloadId)) {
+          for (const clientRes of activeDownloads.get(downloadId)) {
+            clientRes.write(`data: ${JSON.stringify({
+              type: 'progress',
+              data: output
+            })}\n\n`);
+          }
+        }
       }
     });
 
+    // Handle process completion
     childProcess.on('close', (code) => {
-      if (code !== 0 && !res.headersSent) {
-        res.status(500).json({ error: `Process exited with code ${code}` });
+      if (activeDownloads.has(downloadId)) {
+        for (const clientRes of activeDownloads.get(downloadId)) {
+          clientRes.write(`data: ${JSON.stringify({
+            type: 'complete',
+            code: code
+          })}\n\n`);
+          clientRes.end();
+        }
+        activeDownloads.delete(downloadId);
+      }
+    });
+
+    // Handle errors
+    childProcess.on('error', (error) => {
+      if (activeDownloads.has(downloadId)) {
+        for (const clientRes of activeDownloads.get(downloadId)) {
+          clientRes.write(`data: ${JSON.stringify({
+            type: 'error',
+            error: error.message
+          })}\n\n`);
+          clientRes.end();
+        }
+        activeDownloads.delete(downloadId);
       }
     });
 
   } catch (error) {
     console.error('Download error:', error);
-    if (childProcess) childProcess.kill();
-    if (!res.headersSent) {
-      res.status(500).json({ 
-        error: 'Download failed',
-        details: error.message
-      });
-    }
+    res.status(500).json({ error: 'Download failed', details: error.message });
   }
+});
+
+// SSE endpoint for progress updates
+app.get('/download/stream/:id', (req, res) => {
+  const { id } = req.params;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  if (!activeStreams[id]) {
+    activeStreams[id] = { clients: [] };
+  }
+
+  const clientId = Date.now();
+  const newClient = {
+    id: clientId,
+    res
+  };
+
+  activeStreams[id].clients.push(newClient);
+
+  req.on('close', () => {
+    activeStreams[id].clients = activeStreams[id].clients.filter(c => c.id !== clientId);
+  });
 });
 
 app.get('/download/audio', async (req, res) => {
@@ -261,7 +338,7 @@ app.get('/download/audio', async (req, res) => {
     console.error('Audio download error:', error);
     if (childProcess) childProcess.kill();
     if (!res.headersSent) {
-      res.status(500).json({ 
+      res.status(500).json({
         error: 'Audio download failed',
         details: error.message
       });
@@ -284,9 +361,9 @@ app.post('/merge', async (req, res) => {
   try {
     // Check if files were uploaded
     if (!req.files || !req.files.video || !req.files.audio) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         success: false,
-        error: 'Both video and audio files are required' 
+        error: 'Both video and audio files are required'
       });
     }
 
@@ -301,7 +378,7 @@ app.post('/merge', async (req, res) => {
     const videoPath = path.join(tempDir, `video_${timestamp}.mp4`);
     const audioPath = path.join(tempDir, `audio_${timestamp}.mp3`);
     const outputPath = path.join(tempDir, `merged_${timestamp}.mp4`);
-    
+
 
     // Save files
     await req.files.video.mv(videoPath);
@@ -332,14 +409,14 @@ app.post('/merge', async (req, res) => {
     });
 
     // Respond with success
-    res.json({ 
+    res.json({
       success: true,
       filename: `merged_${timestamp}.mp4`
     });
 
   } catch (error) {
     console.error('Merge error:', error);
-    res.status(500).json({ 
+    res.status(500).json({
       success: false,
       error: error.message || 'Merge failed'
     });
